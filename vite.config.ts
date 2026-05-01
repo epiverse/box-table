@@ -14,8 +14,13 @@ export default defineConfig({
   server: {
     port: 5173,
   },
-  // SheetJS ships as CommonJS; let Vite pre-bundle it on first dev run.
   optimizeDeps: {
+    // SheetJS ships as CommonJS; let Vite pre-bundle it on first dev run.
     include: ['xlsx'],
+    // data-table resolves its DuckDB worker via `new URL("assets/worker-*.js",
+    // import.meta.url)`. Pre-bundling moves the JS into .vite/deps/ but does
+    // not copy the sibling `assets/` folder, so the worker URL 404s in dev.
+    // Serving the package straight from node_modules keeps the URL valid.
+    exclude: ['@jeyabbalas/data-table'],
   },
 });
