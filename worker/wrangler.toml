@@ -1,0 +1,8 @@
+name = "boxtable-token"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+
+# Secrets are NOT declared here; set them with `wrangler secret put`:
+#   wrangler secret put BOX_CLIENT_ID
+#   wrangler secret put BOX_CLIENT_SECRET
+#   wrangler secret put ALLOWED_ORIGIN

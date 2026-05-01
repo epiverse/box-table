@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>BoxTable</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 22 22'%3E%3Crect x='2' y='2' width='18' height='18' rx='3' fill='none' stroke='%230061D5' stroke-width='1.75'/%3E%3Cline x1='2' y1='11' x2='20' y2='11' stroke='%230061D5' stroke-width='1.25'/%3E%3Cline x1='11' y1='2' x2='11' y2='20' stroke='%230061D5' stroke-width='1.25'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header class="page-header">
+      <div id="brand-host"></div>
+      <span class="page-header__version">v<span id="version">…</span></span>
+    </header>
+
+    <main>
+      <div class="card">
+        <div class="status-bar">
+          <span id="init-status" class="init-status">Initializing…</span>
+          <fieldset class="theme-toggle" aria-label="Theme">
+            <legend class="sr-only">Theme</legend>
+            <label><input type="radio" name="theme" value="light" /> Light</label>
+            <label><input type="radio" name="theme" value="dark" /> Dark</label>
+            <label><input type="radio" name="theme" value="auto" checked /> Auto</label>
+          </fieldset>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Load Data</h2>
+        <div class="row row--mb">
+          <input type="file" id="file-input" accept=".csv,.tsv,.json,.ndjson,.jsonl,.parquet,.xlsx,.xls" />
+          <button id="load-file-btn" disabled>Load File</button>
+        </div>
+        <div class="row row--mb">
+          <input
+            type="text"
+            id="url-input"
+            placeholder="Enter URL to a CSV, JSON, Parquet, or XLSX file…"
+          />
+          <button id="load-url-btn" disabled>Load URL</button>
+        </div>
+        <div class="row row--box">
+          <span class="row-label">Or load from your Box account:</span>
+          <button id="box-connect-btn" type="button" class="btn--box" disabled>Connect to Box</button>
+          <button id="box-browse-btn" type="button" class="btn--box" hidden>Browse Box files</button>
+          <button id="box-disconnect-btn" type="button" class="btn--ghost" hidden>Disconnect</button>
+        </div>
+        <div class="row row--examples">
+          <span class="row-label">Try a sample:</span>
+          <button
+            type="button"
+            class="chip"
+            data-url="https://raw.githubusercontent.com/jeyabbalas/data-table/refs/heads/main/tests/fixtures/datasets/csv/titanic.csv"
+          >
+            Titanic (CSV)
+          </button>
+          <button
+            type="button"
+            class="chip"
+            data-url="https://raw.githubusercontent.com/jeyabbalas/data-table/refs/heads/main/tests/fixtures/datasets/json/palmer_penguins.json"
+          >
+            Palmer Penguins (JSON)
+          </button>
+          <button
+            type="button"
+            class="chip"
+            data-url="https://raw.githubusercontent.com/jeyabbalas/data-table/main/tests/fixtures/datasets/parquet/nyc_taxi.parquet"
+          >
+            NYC Taxi (Parquet)
+          </button>
+        </div>
+      </div>
+
+      <div class="card card--no-padding">
+        <div id="table-container" class="table-wrapper"></div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content: space-between; align-items: center">
+          <div id="table-info" class="info-panel">
+            Load a file, URL, or Box spreadsheet to begin.
+          </div>
+          <div class="btn-group">
+            <button id="undo-btn" disabled class="btn--secondary" title="Undo (Ctrl+Z)">Undo</button>
+            <button id="redo-btn" disabled class="btn--secondary" title="Redo (Ctrl+Shift+Z)">
+              Redo
+            </button>
+            <button id="reset-btn" disabled class="btn--secondary" title="Reset to original state">
+              Reset
+            </button>
+            <button id="clear-session-btn" disabled class="btn--secondary">Clear Session</button>
+            <button id="export-btn" disabled class="btn--secondary">Export</button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
