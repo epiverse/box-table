@@ -298,7 +298,7 @@ button:disabled {
   padding: 0.3rem 0.7rem;
   font-size: 0.8rem;
   font-weight: 500;
-  background: var(--chip-bg);
+  background: transparent;
   color: var(--chip-fg);
   border: 1px solid var(--chip-border);
   border-radius: 999px;
@@ -306,9 +306,12 @@ button:disabled {
   transition: background 0.15s ease, border-color 0.15s ease;
 }
 
-.chip:hover {
+/* Selector must outrank button:hover:not(:disabled) above, otherwise the
+   global button hover paints chips in --primary-hover (dark blue), drowning
+   out the --chip-fg navy text. */
+button.chip:hover {
+  background: var(--chip-bg);
   border-color: var(--chip-border-hover);
-  box-shadow: 0 0 0 1px var(--chip-border-hover);
 }
 
 .chip:focus-visible {
