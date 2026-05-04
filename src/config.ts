@@ -1,6 +1,6 @@
 // Public Box OAuth client ID. Safe to embed in the browser bundle —
 // `client_secret` lives only in the Cloudflare Worker's env vars.
-export const BOX_CLIENT_ID = '627lww8un9twnoa8f9rjvldf7kb56q1m';
+export const BOX_CLIENT_ID = '1n44fu5yu1l547f2n2fgcw7vhps7kvuw';
 
 // Cloudflare Worker that exchanges an OAuth authorization code for an access
 // token (and refreshes tokens). Override at build time with `VITE_WORKER_URL`
