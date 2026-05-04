@@ -20,11 +20,6 @@ npm run dev
 Open `http://localhost:5173/box-table/`. You can use the File and URL
 loaders right away; Box requires the one-time setup below.
 
-## Setup for Box connectivity
-
-You need two things wired up: the **Box developer app** (where the OAuth
-redirect URIs and CORS allowlist live) and the **Cloudflare Worker** (the
-token-exchange proxy).
 
 ## Privacy
 
