@@ -307,8 +307,8 @@ button:disabled {
 }
 
 .chip:hover {
-  background: var(--chip-bg-hover);
   border-color: var(--chip-border-hover);
+  box-shadow: 0 0 0 1px var(--chip-border-hover);
 }
 
 .chip:focus-visible {
@@ -621,6 +621,27 @@ button:disabled {
 
 .toast--error {
   border-color: var(--error);
+}
+
+/* ===========================================
+   Data-table library hover overrides
+   - The library fills small icon buttons with a strong color on hover, which
+     drowns out the glyph (especially in dark mode where --dt-primary-light is
+     a saturated dark blue). Replace with a faint primary-alpha tint that
+     frames the glyph instead of swallowing it.
+   - Selectors use class-stacking to outrank the library rules regardless of
+     CSS injection order under Vite (style.css is in <link>, library CSS is
+     imported from main.ts).
+   =========================================== */
+
+.dt-add-column-btn.dt-add-column-btn:hover {
+  background: var(--dt-primary-alpha-10);
+  color: var(--dt-primary);
+  box-shadow: inset 1px 0 0 0 var(--dt-border);
+}
+
+.dt-derived-icon-btn.dt-derived-icon-btn:hover {
+  background: var(--dt-primary-alpha-10);
 }
 
 /* ===========================================

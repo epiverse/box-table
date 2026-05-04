@@ -1,5 +1,7 @@
 # BoxTable
 
+This app is live at: https://epiverse.github.io/box-table/
+
 Privacy-first, client-side spreadsheet viewer. Load CSV / JSON / Parquet /
 XLSX from a local file, a public URL, or your Box account, and explore them
 in an interactive table powered by [`@jeyabbalas/data-table`](https://github.com/jeyabbalas/data-table).
@@ -9,16 +11,6 @@ Your data never leaves your machine — the only network call BoxTable makes
 on its own behalf is the OAuth token exchange that lets you connect to
 your Box account, and that goes through a tiny Cloudflare Worker that
 holds the OAuth `client_secret` so it stays out of the public bundle.
-
-## Quickstart
-
-```bash
-npm install
-npm run dev
-```
-
-Open `http://localhost:5173/box-table/`. You can use the File and URL
-loaders right away; Box requires the one-time setup below.
 
 
 ## Privacy
