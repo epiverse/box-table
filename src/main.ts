@@ -1,10 +1,29 @@
 /**
  * BoxTable — entry point.
  *
- * Wires three data sources (file, URL, Box) to the @jeyabbalas/data-table
- * library. Session caching, hash-based content identity, and snapshot
- * restoration are ported from the data-table demo. Box adds the OAuth
- * round-trip + a folder-browser modal.
+ * Embeds @jeyabbalas/data-table and owns the page around it: the file
+ * picker, the URL box, the Box connection and folder browser, the loading
+ * overlay and the status bar. It follows the library's demo, and differs
+ * from it in one thing: Box is a third source beside files and URLs.
+ *
+ * The page never reads a dataset itself: see `loaders/prepare.ts`.
+ *
+ * Persistence convention:
+ * - File uploads use a fresh per-click `tableName`
+ *   (`dt_file_${ts36}_${counter}`). Re-uploading the same file is a
+ *   deliberate user action and always starts a fresh session, even when
+ *   the bytes are identical to the prior upload.
+ * - URL and Box loads use a SHA-256 of the downloaded bytes (truncated to
+ *   16 hex chars) as the `tableName`; see `fingerprint` for large ones. Same
+ *   content → same tableName → snapshot restored (or no-op if the same hash
+ *   is already loaded). Different content → different tableName → fresh
+ *   state, previous snapshot evicted. A workbook's identity is its chosen
+ *   sheet's converted bytes.
+ * - The loaded dataset is cached in IndexedDB so a refresh restores it
+ *   without a network round-trip, a Box sign-in or a file picker prompt;
+ *   see `cacheLoadedSource`.
+ * - Only the most recent dataset's session and cache are kept; loading a
+ *   different dataset deletes the previous IDB rows.
  */
 
 import '@jeyabbalas/data-table/styles';
@@ -15,17 +34,16 @@ import {
   SessionStore,
   type ColorScheme,
   type DataTable,
+  type SourceOptions,
 } from '@jeyabbalas/data-table';
 import {
   isNumericType,
   isDateType,
   isTimeType,
   isCategoricalType,
+  isNestedType,
 } from '@jeyabbalas/data-table/advanced';
 
-import { renderBrand } from './ui/branding';
-import { toast } from './ui/status';
-import { openBoxPicker } from './ui/box-picker';
 import {
   beginAuth,
   disconnect,
@@ -34,60 +52,71 @@ import {
   isConfigured,
   BoxAuthError,
 } from './box/auth';
-import { prepareFromFile } from './loaders/from-file';
-import { prepareFromUrl } from './loaders/from-url';
-import { prepareFromBox } from './loaders/from-box';
-import type { LoadKind, PreparedSource } from './loaders/types';
+import { prepareBox, prepareFile, prepareUrl, type PrepareHooks } from './loaders/prepare';
+import type { FileFormat, LoadKind, PreparedSource } from './loaders/types';
+import { openBoxPicker } from './ui/box-picker';
+import { pickSheet } from './ui/sheet-picker';
+import { toast } from './ui/status';
+import { initThemeSwitch } from './ui/theme';
+import { escapeHtml, formatSize } from './util';
 
 // ----- DOM refs -----
-renderBrand(document.getElementById('brand-host')!);
-
 const versionEl = document.getElementById('version')!;
-const initStatusEl = document.getElementById('init-status')!;
 const fileInput = document.getElementById('file-input') as HTMLInputElement;
-const loadFileBtn = document.getElementById('load-file-btn') as HTMLButtonElement;
+const openFileBtn = document.getElementById('open-file-btn') as HTMLButtonElement;
+const urlForm = document.getElementById('url-form') as HTMLFormElement;
 const urlInput = document.getElementById('url-input') as HTMLInputElement;
 const loadUrlBtn = document.getElementById('load-url-btn') as HTMLButtonElement;
 const boxConnectBtn = document.getElementById('box-connect-btn') as HTMLButtonElement;
 const boxBrowseBtn = document.getElementById('box-browse-btn') as HTMLButtonElement;
 const boxDisconnectBtn = document.getElementById('box-disconnect-btn') as HTMLButtonElement;
+const tableFrameEl = document.getElementById('table-frame')!;
 const tableContainerEl = document.getElementById('table-container')!;
+const emptyErrorEl = document.getElementById('empty-error')!;
+const dropTargetEl = document.getElementById('drop-target')!;
 const tableInfoEl = document.getElementById('table-info')!;
 const exportBtn = document.getElementById('export-btn') as HTMLButtonElement;
 const clearSessionBtn = document.getElementById('clear-session-btn') as HTMLButtonElement;
 const undoBtn = document.getElementById('undo-btn') as HTMLButtonElement;
 const redoBtn = document.getElementById('redo-btn') as HTMLButtonElement;
 const resetBtn = document.getElementById('reset-btn') as HTMLButtonElement;
-const themeRadios = Array.from(document.querySelectorAll<HTMLInputElement>('input[name="theme"]'));
+const exampleChips = Array.from(document.querySelectorAll<HTMLButtonElement>('.chip[data-url]'));
 
 versionEl.textContent = VERSION;
 
-// ----- Theme toggle -----
-let currentScheme: ColorScheme = 'auto';
-for (const radio of themeRadios) {
-  radio.addEventListener('change', () => {
-    if (!radio.checked) return;
-    currentScheme = radio.value as ColorScheme;
-    table?.setColorScheme(currentScheme);
-  });
-}
+const IDLE_MESSAGE = 'Load a file, URL, or Box spreadsheet to get started.';
+
+// ----- Theme -----
+// One switch for the page and the table: the page reads `data-theme` on
+// <html>, and the table takes the same scheme through `setColorScheme`, or
+// as its initial `colorScheme` when it mounts.
+let currentScheme: ColorScheme = initThemeSwitch((scheme) => {
+  currentScheme = scheme;
+  table?.setColorScheme(scheme);
+});
 
 // ----- Shareable `?url=` deep links (URL loads only) -----
+// `?url=…` lets a user share a link that opens the same dataset, with
+// `&sheet=…` naming a workbook's sheet. We use replaceState so loading a
+// dataset doesn't pollute the back/forward stack.
 const URL_PARAM_KEY = 'url';
+const SHEET_PARAM_KEY = 'sheet';
 
-function getUrlParam(): string | null {
+function getUrlParam(key = URL_PARAM_KEY): string | null {
   try {
-    return new URLSearchParams(window.location.search).get(URL_PARAM_KEY);
+    return new URLSearchParams(window.location.search).get(key);
   } catch {
     return null;
   }
 }
 
-function setUrlParam(url: string | null): void {
+function setUrlParam(url: string | null, sheet?: string): void {
   try {
     const params = new URLSearchParams(window.location.search);
     if (url) params.set(URL_PARAM_KEY, url);
     else params.delete(URL_PARAM_KEY);
+    if (url && sheet) params.set(SHEET_PARAM_KEY, sheet);
+    else params.delete(SHEET_PARAM_KEY);
     const qs = params.toString();
     const next = `${window.location.pathname}${qs ? '?' + qs : ''}${window.location.hash}`;
     window.history.replaceState(null, '', next);
@@ -96,17 +125,40 @@ function setUrlParam(url: string | null): void {
   }
 }
 
-// ----- Parquet snapshot cache (IndexedDB) -----
+// ----- Dataset cache for the current dataset -----
+// Stores the active dataset in IndexedDB so a refresh can restore it
+// without re-fetching the URL, re-downloading from Box, or re-prompting for
+// a file. Keyed by the same `tableName` the library uses for its session
+// snapshot.
 const DATA_CACHE_DB = 'boxtable-data-cache';
 const DATA_CACHE_STORE = 'data';
 const LAST_SESSION_KEY = 'boxtable.last-session';
 
+/**
+ * CSV and JSON up to this size are cached as a Parquet export of the
+ * loaded table, which restores faster than parsing the text again. The
+ * export copies the whole table out of DuckDB into the page, on top of the
+ * text the load itself read, so a larger file is cached as it is.
+ */
+const TEXT_EXPORT_LIMIT = 256 * 1024 * 1024;
+
+/**
+ * A download's identity hashes every byte up to this size. Hashing reads
+ * the bytes into memory, so a larger one hashes a sample; see `fingerprint`.
+ */
+const FULL_HASH_LIMIT = 64 * 1024 * 1024;
+const HASH_SAMPLE_BYTES = 4 * 1024 * 1024;
+
 interface LastSession {
   type: LoadKind;
+  /** Display label — URL or file name. Not used for identity. */
   source: string;
-  // For Box: the file ID, used for re-download on restore.
-  boxFileId?: string;
+  /** Identity: `dt_${sha256_16hex}` of the loaded bytes, or a file upload's own. */
   tableName: string;
+  /** A workbook's sheet, which a URL or Box load of it picks again on restore. */
+  sheet?: string;
+  /** For Box: the file ID, used for re-download on restore. */
+  boxFileId?: string;
 }
 
 function openDataCache(): Promise<IDBDatabase | null> {
@@ -128,25 +180,67 @@ function openDataCache(): Promise<IDBDatabase | null> {
   });
 }
 
-async function cacheTableData(
-  tableName: string,
-  buffer: Uint8Array,
-  sourceName: string,
-): Promise<void> {
+/** A cached dataset: what to hand the library on restore, and its format. */
+interface CachedSource {
+  tableName: string;
+  /**
+   * A Blob, which IndexedDB keeps on disk: storing or reading one copies
+   * nothing into the page.
+   */
+  data: Blob;
+  format: FileFormat;
+  sourceName: string;
+  /** How the library reads it, when the defaults would not do. */
+  sourceOptions?: SourceOptions;
+}
+
+async function cacheSource(entry: CachedSource): Promise<void> {
   const db = await openDataCache();
   if (!db) return;
   await new Promise<void>((resolve) => {
-    const tx = db.transaction(DATA_CACHE_STORE, 'readwrite');
-    tx.objectStore(DATA_CACHE_STORE).put({ tableName, buffer, sourceName });
-    tx.oncomplete = (): void => resolve();
-    tx.onerror = (): void => resolve();
+    try {
+      const tx = db.transaction(DATA_CACHE_STORE, 'readwrite');
+      tx.objectStore(DATA_CACHE_STORE).put(entry);
+      tx.oncomplete = (): void => resolve();
+      tx.onerror = (): void => resolve();
+      // A dataset larger than the storage quota aborts the transaction.
+      tx.onabort = (): void => resolve();
+    } catch {
+      resolve();
+    }
   });
   db.close();
 }
 
-async function loadCachedData(
-  tableName: string,
-): Promise<{ buffer: Uint8Array; sourceName: string } | null> {
+/** A cache row as a {@link CachedSource}, including a row an older BoxTable wrote. */
+function toCachedSource(row: unknown): CachedSource | null {
+  if (typeof row !== 'object' || row === null) return null;
+  const { tableName, data, format, sourceName, sourceOptions, buffer } = row as Record<
+    string,
+    unknown
+  >;
+  if (typeof tableName !== 'string') return null;
+  const name = typeof sourceName === 'string' ? sourceName : tableName;
+  if (data instanceof Blob && (format === 'csv' || format === 'json' || format === 'parquet')) {
+    const cached: CachedSource = { tableName, data, format, sourceName: name };
+    if (typeof sourceOptions === 'object' && sourceOptions !== null) {
+      cached.sourceOptions = sourceOptions as SourceOptions;
+    }
+    return cached;
+  }
+  // Older versions cached every dataset as the bytes of a Parquet export.
+  if (buffer instanceof Uint8Array) {
+    return {
+      tableName,
+      data: new Blob([new Uint8Array(buffer)]),
+      format: 'parquet',
+      sourceName: name,
+    };
+  }
+  return null;
+}
+
+async function loadCachedSource(tableName: string): Promise<CachedSource | null> {
   const db = await openDataCache();
   if (!db) return null;
   return new Promise((resolve) => {
@@ -154,7 +248,7 @@ async function loadCachedData(
     const req = tx.objectStore(DATA_CACHE_STORE).get(tableName);
     req.onsuccess = (): void => {
       db.close();
-      resolve(req.result ? { buffer: req.result.buffer, sourceName: req.result.sourceName } : null);
+      resolve(toCachedSource(req.result));
     };
     req.onerror = (): void => {
       db.close();
@@ -192,30 +286,64 @@ async function listCachedTableNames(): Promise<string[]> {
   });
 }
 
-// First 64 bits of SHA-256 over the loaded bytes — same content yields the
-// same tableName, so library snapshots restore. ~50–200ms on 100MB.
-async function hashBytes(bytes: Uint8Array): Promise<string> {
-  // Slice produces an ArrayBufferLike; we know it's an ArrayBuffer because
-  // Uint8Array's underlying buffer is one in browser code.
-  const buf = bytes.buffer.slice(
-    bytes.byteOffset,
-    bytes.byteOffset + bytes.byteLength,
-  ) as ArrayBuffer;
-  const digest = await crypto.subtle.digest('SHA-256', buf);
-  const view = new Uint8Array(digest);
+// ----- Content-hash dataset identity (URL and Box loads) -----
+// SHA-256 (first 64 bits, 16 hex chars) over the downloaded bytes. Same
+// content → same tableName regardless of URL, modification times, or
+// caching layers. crypto.subtle.digest runs off the main thread. File
+// uploads bypass this and get a per-click unique tableName — see
+// `loadPreparedNow` for the policy split.
+//
+// Hashing reads the bytes into memory, all at once: crypto.subtle has no
+// streaming digest. Above FULL_HASH_LIMIT the hash covers the size and the
+// first and last HASH_SAMPLE_BYTES instead. A Parquet file ends with its
+// footer (schema, row-group offsets and column statistics), so a change to
+// its data almost always shows there; a same-size edit in the middle of a
+// large CSV does not, and restores the old session over the new content.
+async function fingerprint(blob: Blob): Promise<string> {
+  const bytes =
+    blob.size <= FULL_HASH_LIMIT
+      ? await blob.arrayBuffer()
+      : await new Blob([
+          String(blob.size),
+          blob.slice(0, HASH_SAMPLE_BYTES),
+          blob.slice(blob.size - HASH_SAMPLE_BYTES),
+        ]).arrayBuffer();
+  const view = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
   let hex = '';
   for (let i = 0; i < 8; i++) hex += view[i].toString(16).padStart(2, '0');
   return hex;
 }
 
-// ----- Library state -----
-const sessionStore = new SessionStore();
-let table: DataTable | null = null;
-// Per-page counter so back-to-back file uploads always get unique tableNames
-// even if the millisecond timestamp collides.
-let fileUploadCounter = 0;
+/** What a load starts from. */
+type Source =
+  | { kind: 'file'; file: File }
+  | { kind: 'url'; url: string }
+  | { kind: 'box'; id: string; name: string; size?: number };
 
-function readPreviousSession(): LastSession | null {
+/** A cached dataset as a {@link PreparedSource}, to restore it. */
+function preparedFromCache(cached: CachedSource): PreparedSource {
+  const file =
+    cached.data instanceof File ? cached.data : new File([cached.data], cached.sourceName);
+  const prepared: PreparedSource = { file, format: cached.format, sourceName: cached.sourceName };
+  if (cached.sourceOptions) prepared.sourceOptions = cached.sourceOptions;
+  return prepared;
+}
+
+// ----- App-owned SessionStore -----
+// Owned by the app (not by any single DataTable instance) so we can
+// directly evict the previous tableName's row when the user switches
+// datasets. createDataTable receives it via `persistence.sessionStore`.
+const sessionStore = new SessionStore();
+
+let table: DataTable | null = null;
+// Per-page counter that ensures every file upload yields a unique
+// `tableName` even when two uploads share a millisecond timestamp.
+let fileUploadCounter = 0;
+// One load at a time: two at once would mount two tables and DuckDB workers
+// if the page has none yet, and hold two large tables in memory if it has.
+let loadRunning = false;
+
+function readLastSession(): LastSession | null {
   try {
     const raw = localStorage.getItem(LAST_SESSION_KEY);
     if (!raw) return null;
@@ -226,7 +354,13 @@ function readPreviousSession(): LastSession | null {
   }
 }
 
+function readPreviousTableName(): string | null {
+  return readLastSession()?.tableName ?? null;
+}
+
 async function pruneOrphans(currentTableName: string | null): Promise<void> {
+  // Keep only the row for currentTableName (if any); drop all other entries
+  // in both stores.
   try {
     const sessionNames = await sessionStore.list();
     for (const name of sessionNames) {
@@ -245,11 +379,42 @@ async function pruneOrphans(currentTableName: string | null): Promise<void> {
   }
 }
 
+// ----- Status bar -----
+
 function updateInfo(message: string): void {
+  tableInfoEl.classList.remove('table-info--error');
   tableInfoEl.innerHTML = message;
 }
 
+/** A failed load, in the status bar and, while no table shows, in the empty frame. */
+function showError(message: string): void {
+  updateInfo(`Error: ${escapeHtml(message)}`);
+  tableInfoEl.classList.add('table-info--error');
+  emptyErrorEl.textContent = message;
+  emptyErrorEl.hidden = false;
+}
+
+function clearError(): void {
+  emptyErrorEl.hidden = true;
+  emptyErrorEl.textContent = '';
+}
+
+const SEP = '<span class="sep" aria-hidden="true"> · </span>';
+
+/** How long the last load took, for the info bar; null while one runs. */
+let lastLoadSeconds: number | null = null;
+/**
+ * The info bar's text while a load runs. A load changes the table's state
+ * as it goes, and the counts that `updateTableInfo` would show meanwhile are
+ * the old dataset's or none.
+ */
+let loadingMessage: string | null = null;
+
 function updateTableInfo(): void {
+  if (loadingMessage !== null) {
+    updateInfo(loadingMessage);
+    return;
+  }
   if (!table) return;
   const { state } = table;
   const tableName = state.tableName.get();
@@ -257,87 +422,281 @@ function updateTableInfo(): void {
 
   const totalRows = state.totalRows.get();
   const filteredRows = state.filteredRows.get();
-  const schema = state.schema.get();
+  // The dataset's columns: the hidden `__rowid__` is the table's own.
+  const schema = state.schema.get().filter((c) => !c.system);
   const filters = state.filters.get();
 
-  const numericCols = schema.filter((c) => isNumericType(c.type)).length;
-  const dateCols = schema.filter((c) => isDateType(c.type)).length;
-  const timeCols = schema.filter((c) => isTimeType(c.type)).length;
-  const categoricalCols = schema.filter((c) => isCategoricalType(c.type)).length;
+  const kinds = (
+    [
+      [schema.filter((c) => isNumericType(c.type)).length, 'numeric'],
+      [schema.filter((c) => isDateType(c.type)).length, 'date'],
+      [schema.filter((c) => isTimeType(c.type)).length, 'time'],
+      [schema.filter((c) => isCategoricalType(c.type)).length, 'categorical'],
+      [schema.filter((c) => isNestedType(c.type)).length, 'nested'],
+    ] as const
+  )
+    .filter(([n]) => n > 0)
+    .map(([n, kind]) => `${n} ${kind}`);
 
   let info =
     filters.length > 0
-      ? `<strong>${filteredRows.toLocaleString()}</strong> / ${totalRows.toLocaleString()} rows, <strong>${schema.length}</strong> columns | <strong>${filters.length}</strong> filter${filters.length > 1 ? 's' : ''}`
-      : `<strong>${totalRows.toLocaleString()}</strong> rows, <strong>${schema.length}</strong> columns`;
-  info += ` (${numericCols} numeric, ${dateCols} date, ${timeCols} time, ${categoricalCols} categorical)`;
+      ? `<strong>${filteredRows.toLocaleString()}</strong> of ${totalRows.toLocaleString()} rows`
+      : `<strong>${totalRows.toLocaleString()}</strong> rows`;
+  info += `${SEP}<strong>${schema.length.toLocaleString()}</strong> columns`;
+  if (kinds.length > 0) info += ` (${kinds.join(', ')})`;
+  if (filters.length > 0) {
+    info += `${SEP}<strong>${filters.length}</strong> filter${filters.length > 1 ? 's' : ''}`;
+  }
 
   const derived = state.derivedColumns.get();
-  if (derived.length > 0) info += ` | <strong>${derived.length}</strong> derived`;
+  if (derived.length > 0) info += `${SEP}<strong>${derived.length}</strong> derived`;
   const pinned = state.pinnedColumns.get();
-  if (pinned.length > 0) info += ` | <strong>${pinned.length}</strong> pinned`;
+  if (pinned.length > 0) info += `${SEP}<strong>${pinned.length}</strong> pinned`;
   const sort = state.sortColumns.get();
   if (sort.length > 0) {
     const desc = sort
-      .map(
-        (s, i) =>
-          `${s.column} (${s.direction === 'asc' ? '▲' : '▼'}${sort.length > 1 ? ` #${i + 1}` : ''})`,
-      )
+      .map((s) => `${escapeHtml(s.column)} ${s.direction === 'asc' ? '▲' : '▼'}`)
       .join(', ');
-    info += ` | <strong>Sort:</strong> ${desc}`;
+    info += `${SEP}sorted by ${desc}`;
+  }
+  if (lastLoadSeconds !== null) info += `${SEP}loaded in ${lastLoadSeconds.toFixed(1)} s`;
+  // Nested and JSON cells open in the value inspector.
+  if (schema.some((c) => isNestedType(c.type) || c.originalType.toUpperCase() === 'JSON')) {
+    info += `${SEP}<span class="hint">F2 or double-click a nested cell to inspect it</span>`;
   }
   updateInfo(info);
 }
 
-interface LoadBytesOptions {
-  meta: { type: LoadKind; source: string; boxFileId?: string };
-  knownTableName?: string;
-  skipParquetCache?: boolean;
+// ----- Loading overlay -----
+
+/**
+ * The overlay over the table while a load runs: what is loading, the step
+ * it is on, and the download's progress. It shows only once a load has
+ * taken {@link LOADING_DELAY_MS}, so a quick one never flashes it, and
+ * counts the seconds once it has taken a few.
+ */
+const LOADING_DELAY_MS = 250;
+
+const loading = (() => {
+  const overlay = document.getElementById('loading')!;
+  const title = document.getElementById('loading-title')!;
+  const detail = document.getElementById('loading-detail')!;
+  const bar = document.getElementById('loading-bar')!;
+  const fill = bar.firstElementChild as HTMLElement;
+  const skip = document.getElementById('loading-skip') as HTMLButtonElement;
+  let showTimer = 0;
+  let clock = 0;
+  let started = 0;
+  let step = '';
+
+  const render = (): void => {
+    const seconds = Math.floor((performance.now() - started) / 1000);
+    detail.textContent = seconds >= 3 ? `${step}${step ? ' · ' : ''}${seconds} s` : step;
+  };
+  const show = (): void => {
+    window.clearTimeout(showTimer);
+    showTimer = window.setTimeout(() => {
+      overlay.hidden = false;
+    }, LOADING_DELAY_MS);
+  };
+  const hide = (): void => {
+    window.clearTimeout(showTimer);
+    overlay.hidden = true;
+  };
+
+  return {
+    /** A load begins, or moves on to `name`. */
+    begin(name: string, { restoring = false } = {}): void {
+      if (!started) {
+        started = performance.now();
+        clock = window.setInterval(render, 1000);
+        tableFrameEl.setAttribute('aria-busy', 'true');
+        show();
+      }
+      title.textContent = name;
+      step = '';
+      if (restoring) skip.hidden = false;
+      bar.hidden = true;
+      render();
+    },
+    step(text: string): void {
+      step = text;
+      render();
+    },
+    /** Determinate progress, 0 to 1; `null` for none. */
+    progress(fraction: number | null): void {
+      bar.hidden = fraction === null;
+      if (fraction !== null) fill.style.width = `${Math.round(fraction * 100)}%`;
+    },
+    /** Out of the way of the sheet picker; the next `begin` brings it back. */
+    pause(): void {
+      hide();
+      window.clearInterval(clock);
+      started = 0;
+    },
+    end(): void {
+      hide();
+      window.clearInterval(clock);
+      started = 0;
+      step = '';
+      skip.hidden = true;
+      bar.hidden = true;
+      tableFrameEl.removeAttribute('aria-busy');
+    },
+  };
+})();
+
+/**
+ * A link that abandons the load at startup and reloads without it. The
+ * load controls are off meanwhile, and a load has no timeout (DuckDB's
+ * start-up fetches included), so without it a stalled restore would hold
+ * the page, and every reload would retry it.
+ */
+const SKIP_LINK = ' · <a href="#" data-action="skip">Skip</a>';
+
+/** How a source's preparation reports to the overlay and the status bar. */
+function prepareHooks(restoring: boolean): PrepareHooks {
+  return {
+    begin(title, status): void {
+      loading.begin(title);
+      loadingMessage = status + (restoring ? SKIP_LINK : '');
+      updateInfo(loadingMessage);
+    },
+    step: (text) => loading.step(text),
+    progress: (fraction) => loading.progress(fraction),
+    pickSheet(fileName, sheets) {
+      loading.pause();
+      return pickSheet(fileName, sheets);
+    },
+  };
 }
 
-async function loadBytes(prepared: PreparedSource, opts: LoadBytesOptions): Promise<void> {
-  updateInfo('Loading data…');
+interface LoadOptions {
+  /** localStorage label + URL-param sync. */
+  meta: { type: LoadKind; source: string; boxFileId?: string };
+  /** Skip re-hashing when the caller already knows the tableName (cache hit). */
+  knownTableName?: string;
+  /** Skip re-caching the dataset when restoring from the existing cache. */
+  skipCache?: boolean;
+  /** A load at startup, for the session: it offers a way to skip it. */
+  restoring?: boolean;
+}
 
-  // Identity policy:
-  //   file → unique per-click (always fresh)
-  //   url, box → SHA-256 of bytes (content-aware caching)
+/**
+ * Cache a loaded dataset for refresh. Parquet is cached as the file
+ * itself: IndexedDB keeps the Blob on disk, and the restore reads it from
+ * there as lazily as the first load read the original. CSV and JSON up to
+ * TEXT_EXPORT_LIMIT are cached as a Parquet export of their source
+ * columns, which leaves out `__rowid__` (the loader rejects a source that
+ * has one) and derived columns; larger ones as the file itself.
+ */
+async function cacheLoadedSource(
+  t: DataTable,
+  tableName: string,
+  prepared: PreparedSource,
+): Promise<void> {
+  const { file, format, sourceName, sourceOptions } = prepared;
+  if (format === 'parquet' || file.size > TEXT_EXPORT_LIMIT) {
+    await cacheSource({
+      tableName,
+      data: file,
+      format,
+      sourceName,
+      ...(sourceOptions ? { sourceOptions } : {}),
+    });
+    return;
+  }
+  const baseTable = t.state.baseTableName.get() ?? t.state.tableName.get();
+  const columns = t.state.schema
+    .get()
+    .filter((c) => !c.system && !c.isDerived)
+    .map((c) => quoteIdentifier(c.name))
+    .join(', ');
+  if (!baseTable || !columns) return;
+  const bytes = await t.bridge.exportToBuffer(
+    `SELECT ${columns} FROM ${quoteIdentifier(baseTable)}`,
+    'parquet',
+  );
+  await cacheSource({
+    tableName,
+    data: new Blob([bytes as Uint8Array<ArrayBuffer>]),
+    format: 'parquet',
+    sourceName,
+  });
+}
+
+async function loadPrepared(prepared: PreparedSource, opts: LoadOptions): Promise<void> {
+  lastLoadSeconds = null;
+  clearError();
+  loading.begin(`${opts.restoring ? 'Restoring' : 'Loading'} ${prepared.sourceName}`, {
+    restoring: opts.restoring === true,
+  });
+  loadingMessage =
+    `Loading <strong>${escapeHtml(prepared.sourceName)}</strong> ` +
+    `(${formatSize(prepared.size ?? prepared.file.size)})…` +
+    (opts.restoring ? SKIP_LINK : '');
+  updateInfo(loadingMessage);
+  try {
+    await loadPreparedNow(prepared, opts);
+  } finally {
+    loadingMessage = null;
+  }
+}
+
+async function loadPreparedNow(prepared: PreparedSource, opts: LoadOptions): Promise<void> {
+  // tableName policy:
+  // - knownTableName wins (boot-time restore paths pass the stored ID).
+  // - File upload → unique per-click ID, so re-uploading the same file
+  //   always starts a fresh session.
+  // - URL or Box load → SHA-256 of the downloaded bytes, so the same file
+  //   with unchanged content reuses its snapshot, while changed content
+  //   produces a new tableName and evicts the previous snapshot.
   let tableName: string;
   if (opts.knownTableName) {
     tableName = opts.knownTableName;
   } else if (opts.meta.type === 'file') {
     tableName = `dt_file_${Date.now().toString(36)}_${++fileUploadCounter}`;
   } else {
-    tableName = `dt_${await hashBytes(prepared.bytes)}`;
+    tableName = `dt_${await fingerprint(prepared.file)}`;
   }
-  const previousSession = readPreviousSession();
-  const previousTableName = previousSession?.tableName ?? null;
+  const previousTableName = readPreviousTableName();
+  const session: LastSession = {
+    type: opts.meta.type,
+    source: opts.meta.source,
+    tableName,
+    ...(prepared.sheet ? { sheet: prepared.sheet } : {}),
+    ...(opts.meta.boxFileId ? { boxFileId: opts.meta.boxFileId } : {}),
+  };
 
-  // Skip-if-current: re-loading the same content into the same table is a
-  // no-op at the DuckDB layer; just refresh the labels.
+  // Skip-if-current guard: when the content's hash matches the live table,
+  // there's nothing to do at the DuckDB layer (the snapshot is already in
+  // memory). Refreshing the user-visible labels is enough. Only reachable
+  // for URL and Box loads in practice; file uploads always have a fresh
+  // tableName.
   if (table) {
     const currentBaseTable = table.state.baseTableName.get() ?? table.state.tableName.get();
     if (currentBaseTable === tableName) {
-      persistSession(opts, tableName);
-      setUrlParam(opts.meta.type === 'url' ? opts.meta.source : null);
+      try {
+        localStorage.setItem(LAST_SESSION_KEY, JSON.stringify(session));
+      } catch {
+        /* localStorage unavailable */
+      }
+      setUrlParam(opts.meta.type === 'url' ? opts.meta.source : null, prepared.sheet);
+      loadingMessage = null;
       updateTableInfo();
       return;
     }
   }
 
-  const librarySource: ArrayBuffer | string =
-    prepared.format === 'parquet'
-      ? (prepared.bytes.buffer.slice(
-          prepared.bytes.byteOffset,
-          prepared.bytes.byteOffset + prepared.bytes.byteLength,
-        ) as ArrayBuffer)
-      : new TextDecoder('utf-8').decode(prepared.bytes);
-
   try {
     if (!table) {
+      // Mount first, then load. `createDataTable` with a `source` rejects
+      // when that load fails and leaves its table and worker behind, and the
+      // next load would mount a second one; a table mounted empty stays, and
+      // takes the next load.
+      loading.step('Starting DuckDB…');
       table = await createDataTable({
         container: tableContainerEl,
-        source: librarySource,
-        sourceFormat: prepared.format,
-        tableName,
         persistence: { sessionStore },
         presets: true,
         undoRedo: true,
@@ -346,16 +705,35 @@ async function loadBytes(prepared: PreparedSource, opts: LoadBytesOptions): Prom
         colorScheme: currentScheme,
       });
       wireTableEvents(table);
-    } else {
-      await table.loadData(librarySource, {
-        tableName,
-        sourceFormat: prepared.format,
-      });
+      // Re-apply the scheme the radios show right now: a toggle clicked
+      // while createDataTable was pending hit `table?.setColorScheme` when
+      // `table` was still null and silently no-oped.
+      table.setColorScheme(currentScheme);
+    }
+    // Timed from here: the first load's figure leaves out DuckDB's start-up.
+    loading.step('Reading the file…');
+    const started = performance.now();
+    await table.loadData(prepared.file, {
+      tableName,
+      sourceFormat: prepared.format,
+      ...(prepared.sourceOptions ? { sourceOptions: prepared.sourceOptions } : {}),
+    });
+
+    lastLoadSeconds = (performance.now() - started) / 1000;
+    loadingMessage = null;
+    updateTableInfo();
+
+    // Persist the localStorage pointer AFTER the load resolves — a failed
+    // load should leave the previous session pointer intact.
+    try {
+      localStorage.setItem(LAST_SESSION_KEY, JSON.stringify(session));
+    } catch {
+      /* localStorage unavailable */
     }
 
-    updateTableInfo();
-    persistSession(opts, tableName);
-
+    // Evict the previous dataset's snapshot + cache only after the new load
+    // has succeeded. If the hash matches, no eviction is needed (same
+    // dataset, snapshot already restored).
     if (previousTableName && previousTableName !== tableName) {
       try {
         await sessionStore.delete(previousTableName);
@@ -369,30 +747,24 @@ async function loadBytes(prepared: PreparedSource, opts: LoadBytesOptions): Prom
       }
     }
 
-    setUrlParam(opts.meta.type === 'url' ? opts.meta.source : null);
+    // Keep the shareable `?url=` param in sync with what was just loaded.
+    // File and Box loads aren't shareable, so wipe any stale param the page
+    // was opened with — otherwise a refresh would load the (no longer
+    // relevant) shared dataset on top of the user's data. The URL box
+    // likewise.
+    setUrlParam(opts.meta.type === 'url' ? opts.meta.source : null, prepared.sheet);
+    if (opts.meta.type !== 'url') urlInput.value = '';
 
-    // Cache the loaded table as Parquet for refresh-restore. Skipped when
-    // we just restored from this exact cache entry.
-    if (!opts.skipParquetCache) {
-      const currentTableName = table.state.tableName.get();
-      const baseTable = table.state.baseTableName.get() ?? currentTableName;
-      if (currentTableName && baseTable) {
-        const cacheCols = table.state.schema
-          .get()
-          .filter((c) => !c.system && !c.isDerived)
-          .map((c) => quoteIdentifier(c.name))
-          .join(', ');
-        if (cacheCols) {
-          table.bridge
-            .exportToBuffer(`SELECT ${cacheCols} FROM ${quoteIdentifier(baseTable)}`, 'parquet')
-            .then((buffer) => cacheTableData(currentTableName, buffer, prepared.sourceName))
-            .catch(() => {
-              /* caching is best-effort */
-            });
-        }
-      }
+    // Skipped when restoring from the cache: it holds this dataset already.
+    if (!opts.skipCache) {
+      cacheLoadedSource(table, tableName, prepared).catch(() => {
+        /* caching is best-effort */
+      });
     }
   } catch (error) {
+    // One-time recovery for users who have an older cache that still
+    // contains a leaked `__rowid__` column: clear it and prompt for a
+    // fresh load instead of repeating the failing restore.
     const code = (error as { code?: string }).code;
     if (code === 'LOAD_RESERVED_COLUMN_NAME') {
       try {
@@ -410,75 +782,106 @@ async function loadBytes(prepared: PreparedSource, opts: LoadBytesOptions): Prom
       } catch {
         /* ignore */
       }
-      updateInfo('Cached session was stale and has been cleared. Load a file or URL to continue.');
+      updateInfo(
+        'Cached session was stale and has been cleared. Load a file, URL, or Box spreadsheet to continue.',
+      );
       return;
     }
-    updateInfo(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    // A restore from the cache can fail for a reason that passes (DuckDB not
+    // starting, a network error, a busy machine), so the cached dataset and
+    // its session stay: try again, or forget them.
+    if (opts.skipCache) {
+      updateInfo(
+        `Could not restore <strong>${escapeHtml(prepared.sourceName)}</strong>: ` +
+          `${escapeHtml(message)}. ` +
+          `<a href="#" data-action="retry">Try again</a> · ` +
+          `<a href="#" data-action="forget">Forget it</a>`,
+      );
+      return;
+    }
+    showError(message);
   }
 }
 
-function persistSession(opts: LoadBytesOptions, tableName: string): void {
-  try {
-    const session: LastSession = {
-      type: opts.meta.type,
-      source: opts.meta.source,
-      tableName,
-    };
-    if (opts.meta.boxFileId) session.boxFileId = opts.meta.boxFileId;
-    localStorage.setItem(LAST_SESSION_KEY, JSON.stringify(session));
-  } catch {
-    /* localStorage unavailable */
+/** What the status bar says when nothing is loading: the table's counts, or how to start. */
+function showIdleInfo(): void {
+  if (table?.state.tableName.get()) updateTableInfo();
+  else updateInfo(IDLE_MESSAGE);
+}
+
+function metaOf(source: Source, prepared: PreparedSource): LoadOptions['meta'] {
+  switch (source.kind) {
+    case 'file':
+      return { type: 'file', source: prepared.sourceName };
+    case 'url':
+      return { type: 'url', source: source.url };
+    case 'box':
+      return { type: 'box', source: source.name, boxFileId: source.id };
   }
 }
 
-async function loadFromFile(file: File): Promise<void> {
+async function loadSource(
+  source: Source,
+  { restoring = false, sheet = null as string | null } = {},
+): Promise<void> {
+  const hooks = prepareHooks(restoring);
   try {
-    const prepared = await prepareFromFile(file);
-    await loadBytes(prepared, { meta: { type: 'file', source: file.name } });
-    fileInput.value = '';
+    const prepared =
+      source.kind === 'file'
+        ? await prepareFile(source.file, hooks, sheet)
+        : source.kind === 'url'
+          ? await prepareUrl(source.url, hooks, sheet)
+          : await prepareBox(source, hooks, sheet);
+    // The sheet picker was dismissed: the table keeps what it had.
+    if (!prepared) {
+      loadingMessage = null;
+      showIdleInfo();
+      return;
+    }
+    await loadPrepared(prepared, { meta: metaOf(source, prepared), restoring });
   } catch (error) {
-    updateInfo(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
-  }
-}
-
-async function loadFromUrl(url: string): Promise<void> {
-  try {
-    const prepared = await prepareFromUrl(url);
-    await loadBytes(prepared, { meta: { type: 'url', source: url } });
-  } catch (error) {
-    updateInfo(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
-  }
-}
-
-async function loadFromBox(fileId: string, fileName: string): Promise<void> {
-  try {
-    updateInfo(`Downloading <strong>${fileName}</strong> from Box…`);
-    const prepared = await prepareFromBox(fileId, fileName);
-    await loadBytes(prepared, {
-      meta: { type: 'box', source: fileName, boxFileId: fileId },
-    });
-  } catch (error) {
+    loadingMessage = null;
+    const message = error instanceof Error ? error.message : 'Unknown error';
     if (error instanceof BoxAuthError) {
+      // The Box session is gone (expired or revoked): offer to connect again.
       updateAuthUi();
-      toast(error.message, 'error');
-      return;
+      showError(`${message} Connect to Box again to open this file.`);
+    } else {
+      showError(message);
     }
-    updateInfo(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  } finally {
+    // Reset the file picker so the user can immediately re-select the same
+    // file (browsers suppress the change event on identical reselection).
+    if (source.kind === 'file') fileInput.value = '';
   }
 }
 
 function wireTableEvents(t: DataTable): void {
+  // Info bar refresh on any state change.
   t.on('filterChange', updateTableInfo);
   t.on('sortChange', updateTableInfo);
   t.on('columnChange', updateTableInfo);
   t.on('derivedChange', updateTableInfo);
 
+  // The loading overlay's steps.
+  const STEPS = { reading: 'Reading the file…', parsing: 'Parsing…', indexing: 'Indexing…' };
+  t.on('loadProgress', ({ stage }) => {
+    if (loadRunning && stage in STEPS) loading.step(STEPS[stage as keyof typeof STEPS]);
+  });
+  t.on('loadComplete', () => {
+    if (loadRunning) loading.step('Drawing the table…');
+  });
+
+  // Undo/redo/reset button state.
   t.on('undoChange', ({ canUndo, canRedo }) => {
     undoBtn.disabled = !canUndo;
     redoBtn.disabled = !canRedo;
     resetBtn.disabled = !canUndo;
   });
 
+  // Export and Clear Session are enabled whenever a table is loaded.
+  // Signal.subscribe doesn't replay the current value, so sync once manually.
   const syncDataDependentBtns = (name: string | null): void => {
     exportBtn.disabled = !name;
     clearSessionBtn.disabled = !name;
@@ -487,26 +890,45 @@ function wireTableEvents(t: DataTable): void {
   syncDataDependentBtns(t.state.tableName.get());
 }
 
-// ----- Box auth UI -----
+// ----- One load at a time -----
+
+function setLoadControlsDisabled(disabled: boolean): void {
+  openFileBtn.disabled = disabled;
+  fileInput.disabled = disabled;
+  loadUrlBtn.disabled = disabled;
+  for (const chip of exampleChips) chip.disabled = disabled;
+  updateAuthUi();
+}
+
+/** Run `task` unless a load is running, with the load controls off meanwhile. */
+async function exclusively(task: () => Promise<void>): Promise<void> {
+  if (loadRunning) return;
+  loadRunning = true;
+  setLoadControlsDisabled(true);
+  try {
+    await task();
+  } finally {
+    loadRunning = false;
+    loading.end();
+    setLoadControlsDisabled(false);
+  }
+}
+
+// ----- Box -----
+
+/** The Box controls: Connect when signed out, Open and Disconnect when signed in. */
 function updateAuthUi(): void {
-  if (!isConfigured()) {
-    boxConnectBtn.disabled = true;
-    boxConnectBtn.title = 'Box token-exchange worker is not configured. See README.';
-    boxConnectBtn.hidden = false;
-    boxBrowseBtn.hidden = true;
-    boxDisconnectBtn.hidden = true;
-    return;
-  }
-  if (isAuthenticated()) {
-    boxConnectBtn.hidden = true;
-    boxBrowseBtn.hidden = false;
-    boxDisconnectBtn.hidden = false;
-  } else {
-    boxConnectBtn.hidden = false;
-    boxConnectBtn.disabled = false;
-    boxBrowseBtn.hidden = true;
-    boxDisconnectBtn.hidden = true;
-  }
+  const configured = isConfigured();
+  const connected = configured && isAuthenticated();
+  boxConnectBtn.hidden = connected;
+  boxBrowseBtn.hidden = !connected;
+  boxDisconnectBtn.hidden = !connected;
+  boxConnectBtn.disabled = loadRunning || !configured;
+  boxConnectBtn.title = configured
+    ? 'Sign in to Box to open files from your account'
+    : 'Box is not available: the token-exchange worker is not configured (see README)';
+  boxBrowseBtn.disabled = loadRunning;
+  boxDisconnectBtn.disabled = loadRunning;
 }
 
 boxConnectBtn.addEventListener('click', () => {
@@ -519,8 +941,11 @@ boxConnectBtn.addEventListener('click', () => {
 
 boxBrowseBtn.addEventListener('click', () => {
   openBoxPicker({
-    onSelect: ({ id, name }) => void loadFromBox(id, name),
-    onError: (msg) => toast(msg, 'error'),
+    onSelect: (file) => void exclusively(() => loadSource({ kind: 'box', ...file })),
+    onAuthError: (err) => {
+      updateAuthUi();
+      toast(`${err.message} Connect to Box again.`, 'error');
+    },
   });
 });
 
@@ -529,6 +954,52 @@ boxDisconnectBtn.addEventListener('click', () => {
   updateAuthUi();
   toast('Disconnected from Box.', 'info');
 });
+
+// ----- Links in the info bar -----
+// Put there by the startup restore and its failure: try it again, forget
+// the last session and its cached dataset, or skip a restore in progress.
+
+/** Abandon the load at startup, and reload without it. */
+function skipRestore(): void {
+  try {
+    localStorage.removeItem(LAST_SESSION_KEY);
+  } catch {
+    /* ignore */
+  }
+  setUrlParam(null);
+  window.location.reload();
+}
+
+tableInfoEl.addEventListener('click', (event) => {
+  const link = (event.target as Element | null)?.closest<HTMLElement>('a[data-action]');
+  if (!link) return;
+  event.preventDefault();
+  const action = link.dataset.action;
+  if (action === 'retry') {
+    void exclusively(restoreSession);
+    return;
+  }
+  if (action === 'skip') {
+    skipRestore();
+    return;
+  }
+  const tableName = readPreviousTableName();
+  try {
+    localStorage.removeItem(LAST_SESSION_KEY);
+  } catch {
+    /* ignore */
+  }
+  if (action === 'forget') {
+    if (tableName) {
+      clearCachedData(tableName).catch(() => {
+        /* best-effort */
+      });
+    }
+    updateInfo(IDLE_MESSAGE);
+  }
+});
+
+document.getElementById('loading-skip')!.addEventListener('click', skipRestore);
 
 // ----- UI wiring -----
 exportBtn.addEventListener('click', () => table?.openExportDialog());
@@ -551,113 +1022,175 @@ clearSessionBtn.addEventListener('click', async () => {
   updateInfo('Session cleared. Load a file, URL, or Box spreadsheet to start fresh.');
 });
 
-loadFileBtn.addEventListener('click', () => {
+// A file loads as soon as it is picked.
+openFileBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
   const file = fileInput.files?.[0];
-  if (file) void loadFromFile(file);
-});
-loadUrlBtn.addEventListener('click', () => {
-  const url = urlInput.value.trim();
-  if (url) void loadFromUrl(url);
-});
-urlInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !loadUrlBtn.disabled) {
-    const url = urlInput.value.trim();
-    if (url) void loadFromUrl(url);
-  }
+  if (file) void exclusively(() => loadSource({ kind: 'file', file }));
 });
 
-for (const chip of document.querySelectorAll<HTMLButtonElement>('.chip[data-url]')) {
+// The URL input stays enabled while a load runs; `exclusively` turns Enter away.
+urlForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const url = urlInput.value.trim();
+  if (url) void exclusively(() => loadSource({ kind: 'url', url }));
+});
+
+// Example dataset chips — clicking loads the URL through the same path as the
+// URL input, so format auto-detection and `?url=` syncing both happen for free.
+for (const chip of exampleChips) {
   chip.addEventListener('click', () => {
     const url = chip.dataset.url;
-    if (!url || loadUrlBtn.disabled) return;
+    if (!url || loadRunning) return;
     urlInput.value = url;
-    void loadFromUrl(url);
+    void exclusively(() => loadSource({ kind: 'url', url }));
   });
 }
 
+// ----- Drag and drop -----
+// A file dropped anywhere on the page loads as if picked. Drags that carry
+// no file, such as the table's own column drags, are left alone.
+let dragDepth = 0;
+
+const carriesFiles = (event: DragEvent): boolean =>
+  Array.from(event.dataTransfer?.types ?? []).includes('Files');
+
+window.addEventListener('dragenter', (event) => {
+  if (!carriesFiles(event)) return;
+  event.preventDefault();
+  if (dragDepth++ === 0 && !loadRunning) dropTargetEl.hidden = false;
+});
+window.addEventListener('dragover', (event) => {
+  if (!carriesFiles(event)) return;
+  event.preventDefault();
+  event.dataTransfer!.dropEffect = loadRunning ? 'none' : 'copy';
+});
+window.addEventListener('dragleave', (event) => {
+  if (!carriesFiles(event)) return;
+  if (--dragDepth <= 0) {
+    dragDepth = 0;
+    dropTargetEl.hidden = true;
+  }
+});
+window.addEventListener('drop', (event) => {
+  if (!carriesFiles(event)) return;
+  event.preventDefault();
+  dragDepth = 0;
+  dropTargetEl.hidden = true;
+  const file = event.dataTransfer?.files[0];
+  if (file) void exclusively(() => loadSource({ kind: 'file', file }));
+});
+
 // ----- Init + auto-restore -----
 (async () => {
-  // OAuth callback first — may throw if state mismatched. Run before
-  // anything else so the URL is scrubbed before any other code reads it.
+  updateAuthUi();
+  updateInfo(IDLE_MESSAGE);
+  // The OAuth callback first: it scrubs `?code=…&state=…` from the address
+  // before anything else reads it.
   try {
-    if (await handleCallback()) {
-      toast('Connected to Box.', 'info');
-    }
+    if (await handleCallback()) toast('Connected to Box.', 'info');
   } catch (err) {
     toast(err instanceof Error ? err.message : 'Box authentication failed.', 'error');
   }
-
-  initStatusEl.textContent = 'DuckDB Ready';
-  initStatusEl.classList.add('init-status--success');
-  loadFileBtn.disabled = false;
-  loadUrlBtn.disabled = false;
   updateAuthUi();
-  updateInfo('Load a file, URL, or Box spreadsheet to begin.');
-
   await sessionStore.open();
+  await exclusively(restoreSession);
+})();
 
-  // Shared `?url=` deep links take precedence over session restore.
+/** Load what the page was opened for: a shared `?url=`, or the last session. */
+async function restoreSession(): Promise<void> {
+  // Shared `?url=` deep links take precedence over the localStorage
+  // session-restore. Someone opening the link expects to see the dataset it
+  // references, not whatever happened to be in this browser's last
+  // session. Hashing the downloaded bytes detects content changes since the
+  // last visit — the new hash differs from `previousTableName`, the previous
+  // snapshot is evicted, and the user gets a fresh state on the new content.
   const sharedUrl = getUrlParam();
   if (sharedUrl) {
     urlInput.value = sharedUrl;
-    updateInfo(`Loading shared dataset: <strong>${sharedUrl}</strong>…`);
-    let prepared: PreparedSource;
+    loading.begin(`Loading ${sharedUrl.split('/').pop() || sharedUrl}`, { restoring: true });
+    updateInfo(`Loading shared dataset: <strong>${escapeHtml(sharedUrl)}</strong>…${SKIP_LINK}`);
+    let prepared: PreparedSource | null;
     try {
-      prepared = await prepareFromUrl(sharedUrl);
+      prepared = await prepareUrl(sharedUrl, prepareHooks(true), getUrlParam(SHEET_PARAM_KEY));
     } catch (err) {
-      updateInfo(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      loadingMessage = null;
+      showError(err instanceof Error ? err.message : 'Unknown error');
       return;
     }
-    const tableName = `dt_${await hashBytes(prepared.bytes)}`;
+    if (!prepared) {
+      loadingMessage = null;
+      showIdleInfo();
+      return;
+    }
+    const tableName = `dt_${await fingerprint(prepared.file)}`;
     await pruneOrphans(tableName);
-    await loadBytes(prepared, {
+    await loadPrepared(prepared, {
       meta: { type: 'url', source: sharedUrl },
       knownTableName: tableName,
+      restoring: true,
     });
     return;
   }
 
   try {
-    const session = readPreviousSession();
+    const session = readLastSession();
     if (!session) {
+      // Either first-ever load or the session was cleared. Still prune any
+      // orphans so storage doesn't grow without bound.
       await pruneOrphans(null);
       return;
     }
     await pruneOrphans(session.tableName);
-    const cached = await loadCachedData(session.tableName);
+    const cached = await loadCachedSource(session.tableName);
     if (cached) {
-      updateInfo(`Restoring session: <strong>${cached.sourceName}</strong>…`);
-      const bytes = new Uint8Array(cached.buffer as unknown as ArrayBufferLike);
-      await loadBytes(
-        { bytes, format: 'parquet', sourceName: cached.sourceName },
-        {
-          meta: { type: session.type, source: session.source, boxFileId: session.boxFileId },
-          knownTableName: session.tableName,
-          skipParquetCache: true,
-        },
+      updateInfo(
+        `Restoring session: <strong>${escapeHtml(cached.sourceName)}</strong>…${SKIP_LINK}`,
       );
+      const prepared = preparedFromCache(cached);
+      // A workbook's sheet, for the `&sheet=` the restored `?url=` keeps.
+      if (session.sheet) prepared.sheet = session.sheet;
+      const meta: LoadOptions['meta'] = { type: session.type, source: session.source };
+      if (session.boxFileId) meta.boxFileId = session.boxFileId;
+      await loadPrepared(prepared, {
+        meta,
+        knownTableName: session.tableName,
+        // Cache hit — what we have IS the cache, no need to re-write.
+        skipCache: true,
+        restoring: true,
+      });
     } else if (session.type === 'url') {
       urlInput.value = session.source;
-      void loadFromUrl(session.source);
-    } else if (session.type === 'box' && session.boxFileId && isAuthenticated()) {
-      void loadFromBox(session.boxFileId, session.source);
-    } else {
-      updateInfo(
-        `Previous session: <strong>${session.source}</strong> — ` +
-          `load the same file to restore your state, or ` +
-          `<a href="#" id="dismiss-session">dismiss</a>.`,
-      );
-      document.getElementById('dismiss-session')?.addEventListener('click', (e) => {
-        e.preventDefault();
-        try {
-          localStorage.removeItem(LAST_SESSION_KEY);
-        } catch {
-          /* ignore */
-        }
-        updateInfo('Load a file, URL, or Box spreadsheet to begin.');
+      loading.begin(`Loading ${session.source.split('/').pop() || session.source}`, {
+        restoring: true,
       });
+      updateInfo(`Loading <strong>${escapeHtml(session.source)}</strong>…${SKIP_LINK}`);
+      // No cache — re-fetch the URL. Hashing the fresh bytes lets us
+      // detect content changes vs. the previous session.
+      await loadSource(
+        { kind: 'url', url: session.source },
+        { restoring: true, sheet: session.sheet ?? null },
+      );
+    } else if (session.type === 'box' && session.boxFileId && isAuthenticated()) {
+      loading.begin(`Loading ${session.source}`, { restoring: true });
+      updateInfo(`Loading <strong>${escapeHtml(session.source)}</strong> from Box…${SKIP_LINK}`);
+      // No cache — re-download from Box, hashed like a URL's bytes.
+      await loadSource(
+        { kind: 'box', id: session.boxFileId, name: session.source },
+        { restoring: true, sheet: session.sheet ?? null },
+      );
+    } else {
+      const how =
+        session.type === 'box'
+          ? 'connect to Box and open it again'
+          : 'load the same file';
+      updateInfo(
+        `Previous session: <strong>${escapeHtml(session.source)}</strong> — ` +
+          `${how} to restore your state, or ` +
+          `<a href="#" data-action="forget">dismiss</a>.`,
+      );
     }
   } catch {
     /* localStorage unavailable */
   }
-})();
+}

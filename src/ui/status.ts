@@ -1,6 +1,6 @@
-// Tiny toast for transient errors. The info bar in the bottom card shows
-// long-form status; toasts are for things the user might miss while focused
-// on the table.
+// Tiny toast for Box connection news and transient errors. The status bar
+// shows long-form status; toasts are for things the user might miss while
+// focused on the table.
 
 let host: HTMLDivElement | null = null;
 
@@ -8,6 +8,8 @@ function ensureHost(): HTMLDivElement {
   if (host) return host;
   host = document.createElement('div');
   host.className = 'toast-host';
+  host.setAttribute('role', 'status');
+  host.setAttribute('aria-live', 'polite');
   document.body.appendChild(host);
   return host;
 }

@@ -2,11 +2,13 @@
 
 This app is live at: https://epiverse.github.io/box-table/
 
-Privacy-first, client-side spreadsheet viewer. Load CSV / JSON / Parquet /
-XLSX from a local file, a public URL, or your Box account, and explore them
-in an interactive table powered by [`@jeyabbalas/data-table`](https://github.com/jeyabbalas/data-table).
+Privacy-first, client-side spreadsheet viewer. Load CSV / JSON / Parquet
+files or Excel workbooks (.xlsx, .xlsm, .xlsb, .xls, .ods; pick the sheet)
+from a local file, a public URL, or your Box account, and explore them in an
+interactive table powered by [`@jeyabbalas/data-table`](https://github.com/jeyabbalas/data-table).
 
-All parsing happens in the browser via DuckDB-WASM (and SheetJS for XLSX).
+All parsing happens in the browser via DuckDB-WASM (and SheetJS, in a Web
+Worker, for Excel workbooks).
 Your data never leaves your machine — the only network call BoxTable makes
 on its own behalf is the OAuth token exchange that lets you connect to
 your Box account, and that goes through a tiny Cloudflare Worker that
@@ -16,7 +18,7 @@ holds the OAuth `client_secret` so it stays out of the public bundle.
 ## Privacy
 
 - File contents stay in your browser — they are parsed by DuckDB-WASM (and
-  SheetJS for XLSX), not uploaded anywhere.
+  SheetJS for Excel workbooks), not uploaded anywhere.
 - Box content is downloaded from Box directly into your browser.
 - Box OAuth tokens live only in `sessionStorage` (cleared when you close
   the tab).

@@ -106,12 +106,14 @@ export async function listFolder(folderId: string): Promise<BoxFolderListing> {
   };
 }
 
-// Resolves the redirect to dl.boxcloud.com and returns the file bytes plus
-// the Box-supplied filename (used for format detection downstream).
+// Resolves the redirect to dl.boxcloud.com and returns the file as a Blob,
+// with the server's media type (used for format sniffing downstream).
+// `onProgress` hears the bytes received so far, and the total when the
+// response says it (0 otherwise).
 export async function downloadFile(
   fileId: string,
-  fileName: string,
-): Promise<{ bytes: Uint8Array; name: string }> {
+  onProgress?: (loaded: number, total: number) => void,
+): Promise<{ blob: Blob; contentType: string }> {
   const res = await authedFetch(
     `${BOX_API_BASE}/files/${encodeURIComponent(fileId)}/content`,
     { redirect: 'follow' },
@@ -119,6 +121,19 @@ export async function downloadFile(
   if (!res.ok) {
     throw new BoxApiError(`Failed to download file (${res.status})`, res.status);
   }
-  const buf = await res.arrayBuffer();
-  return { bytes: new Uint8Array(buf), name: fileName };
+  const contentType = res.headers.get('content-type') ?? '';
+  if (!onProgress || !res.body) return { blob: await res.blob(), contentType };
+
+  const total = Number(res.headers.get('content-length')) || 0;
+  let loaded = 0;
+  const counted = res.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        loaded += chunk.byteLength;
+        onProgress(loaded, total);
+        controller.enqueue(chunk);
+      },
+    }),
+  );
+  return { blob: await new Response(counted).blob(), contentType };
 }

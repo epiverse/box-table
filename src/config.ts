@@ -13,10 +13,6 @@ export const WORKER_URL: string =
 export const BOX_AUTHORIZE_URL = 'https://account.box.com/api/oauth2/authorize';
 export const BOX_API_BASE = 'https://api.box.com/2.0';
 
-// Spreadsheet-like extensions the picker highlights as loadable.
-export const SUPPORTED_EXTENSIONS = ['csv', 'tsv', 'xlsx', 'xls', 'json', 'ndjson', 'jsonl', 'parquet'] as const;
-export type SupportedExtension = (typeof SUPPORTED_EXTENSIONS)[number];
-
 // The redirect URI sent to Box must match (a) the value in the Box developer
 // console and (b) the value sent in the token-exchange call. We always send
 // `${origin}${BASE_URL}` so the same code works in dev (localhost:5173) and

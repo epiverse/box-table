@@ -14,9 +14,15 @@ export default defineConfig({
   server: {
     port: 5173,
   },
+  // The Excel reader (src/loaders/excel.worker.ts) is a module worker.
+  worker: {
+    format: 'es',
+  },
   optimizeDeps: {
-    // SheetJS ships as CommonJS; let Vite pre-bundle it on first dev run.
-    include: ['xlsx'],
+    // SheetJS reads Excel workbooks, imported only by a worker the page
+    // starts for the first one. Found that late, it would be optimized then,
+    // and the dev server would reload the page in the middle of the load.
+    include: ['xlsx', 'xlsx/dist/cpexcel.full.mjs'],
     // data-table resolves its DuckDB worker via `new URL("assets/worker-*.js",
     // import.meta.url)`. Pre-bundling moves the JS into .vite/deps/ but does
     // not copy the sibling `assets/` folder, so the worker URL 404s in dev.
